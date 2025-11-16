@@ -1,7 +1,7 @@
-# ================================
-# AI Signal Backend – v3.0 (All-in-One Edition)
-# Naing Kyaw • TwelveData + Finnhub • No Yahoo
-# ================================
+# =====================================
+# AI Signal Backend – v3.0 Balanced Edition
+# Naing Kyaw • TwelveData + Finnhub • BUY/SELL Auto-Balance Fix
+# =====================================
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,15 +12,15 @@ import numpy as np
 import time
 import requests
 
-# ======================================================
-# 🔑 API KEYS — (Ready to use)
-# ======================================================
+
+# 🔑 API KEYS
 TD_KEY = "f5acaa85b3824672b23789adafdb85e9"
 FINN_KEY = "d48lfb1r01qnpsnocvngd48lfb1r01qnpsnocvo0"
 
-# ======================================================
-# FASTAPI APP
-# ======================================================
+
+# -------------------------
+# FASTAPI INIT
+# -------------------------
 app = FastAPI()
 
 app.add_middleware(
@@ -30,12 +30,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ======================================================
+
+# -------------------------
 # MODELS
-# ======================================================
+# -------------------------
 class SignalRequest(BaseModel):
     pair: str
     timeframe: str
+
 
 class SignalResponse(BaseModel):
     pair: str
@@ -45,35 +47,39 @@ class SignalResponse(BaseModel):
     trend: str
     price: float
     rsi: float
-    sl: Optional[float] = None
-    tp: Optional[float] = None
+    sl: Optional[float]
+    tp: Optional[float]
     reason: str
 
 
-# ======================================================
+# -------------------------
 # HELPERS
-# ======================================================
-def normalize_pair_for_td(pair):
+# -------------------------
+def normalize_pair_for_td(pair: str):
     return pair.upper().strip()
 
-def normalize_pair_for_finnhub(pair):
+
+def normalize_pair_for_finnhub(pair: str):
     return "OANDA:" + pair.upper().replace("/", "_")
+
 
 TF_MAP_TD = {"5 sec": "1min", "30 sec": "1min", "1 min": "1min"}
 TF_MAP_FH = {"5 sec": "1", "30 sec": "1", "1 min": "1"}
 
-def to_1d(s):
-    if isinstance(s, pd.DataFrame):
-        s = s.iloc[:, 0]
-    return pd.to_numeric(s, errors="coerce")
+
+def to_1d(series):
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[:, 0]
+    return pd.to_numeric(series, errors="coerce")
 
 
-def ema(s, p):
-    s = to_1d(s)
-    return s.ewm(span=p, adjust=False).mean()
+def ema(series, period):
+    s = to_1d(series)
+    return s.ewm(span=period, adjust=False).mean()
 
-def rsi(s, period=14):
-    s = to_1d(s)
+
+def rsi(series, period=14):
+    s = to_1d(series)
     delta = s.diff()
     gain = delta.where(delta > 0, 0)
     loss = (-delta).where(delta < 0, 0)
@@ -82,35 +88,38 @@ def rsi(s, period=14):
     rs = avg_gain / (avg_loss + 1e-9)
     return 100 - (100 / (1 + rs))
 
-def macd(s):
-    s = to_1d(s)
+
+def macd(series):
+    s = to_1d(series)
     fast = ema(s, 12)
     slow = ema(s, 26)
     macd_line = fast - slow
     sig = ema(macd_line, 9)
-    return macd_line, sig, macd_line - sig
+    hist = macd_line - sig
+    return macd_line, sig, hist
 
-def atr(df):
+
+def atr(df, period=14):
     h = to_1d(df["high"])
     l = to_1d(df["low"])
     c = to_1d(df["close"])
     prev = c.shift(1)
     tr = pd.concat([(h - l), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
-    return tr.rolling(14).mean()
+    return tr.rolling(period).mean()
 
 
-# ======================================================
-# CANDLE FETCH (TwelveData → Finnhub Fallback)
-# ======================================================
-def fetch_candles(pair, tf, bars=200):
-
-    # ----- TwelveData -----
+# -------------------------
+# CANDLE FETCH
+# -------------------------
+def fetch_candles(pair, timeframe, bars=200):
+    # ---- TwelveData ----
     try:
         url = (
             "https://api.twelvedata.com/time_series?"
             f"symbol={normalize_pair_for_td(pair)}"
-            f"&interval={TF_MAP_TD.get(tf, '1min')}"
-            f"&apikey={TD_KEY}&outputsize={bars}"
+            f"&interval={TF_MAP_TD.get(timeframe, '1min')}"
+            f"&outputsize={bars}"
+            f"&apikey={TD_KEY}"
         )
         r = requests.get(url, timeout=10).json()
 
@@ -118,136 +127,109 @@ def fetch_candles(pair, tf, bars=200):
             df = pd.DataFrame(r["values"]).rename(columns={"datetime": "time"})
             for c in ["open", "high", "low", "close"]:
                 df[c] = pd.to_numeric(df[c])
-            df = df.iloc[::-1].reset_index(drop=True)
-            if len(df) > 30:
+            df = df.iloc[::-1].dropna()
+            if len(df) > 40:
                 return df
-    except Exception:
-        pass
+    except Exception as e:
+        print("TwelveData error:", e)
 
-    # ----- Finnhub -----
+    # ---- Finnhub Fallback ----
     try:
         now_ts = int(time.time())
         from_ts = now_ts - (bars * 60)
+
         url = (
             "https://finnhub.io/api/v1/forex/candle?"
             f"symbol={normalize_pair_for_finnhub(pair)}"
-            f"&resolution={TF_MAP_FH.get(tf, '1')}"
-            f"&from={from_ts}&to={now_ts}&token={FINN_KEY}"
+            f"&resolution={TF_MAP_FH.get(timeframe, '1')}"
+            f"&from={from_ts}&to={now_ts}"
+            f"&token={FINN_KEY}"
         )
         r = requests.get(url, timeout=10).json()
+
         if r.get("s") == "ok":
             df = pd.DataFrame({
                 "time": r["t"],
                 "open": r["o"],
                 "high": r["h"],
                 "low": r["l"],
-                "close": r["c"],
+                "close": r["c"]
             })
             df = df.dropna().sort_values("time")
             return df
-    except Exception:
-        pass
+    except Exception as e:
+        print("Finnhub error:", e)
 
-    raise RuntimeError("No candle data from TD or Finnhub")
+    raise RuntimeError("No candle data available.")
 
 
-# ======================================================
-# AI LOGIC (v3.0 ALL-IN-ONE)
-# ======================================================
+# -------------------------
+# AI ENGINE v3.0 (Balanced)
+# -------------------------
 def generate_ai_signal(df):
-
     df = df.copy()
     close = to_1d(df["close"])
 
-    # Indicators
+    df["ema9"] = ema(close, 9)
     df["ema20"] = ema(close, 20)
     df["ema50"] = ema(close, 50)
-    df["ema200"] = ema(close, 200)
     df["rsi"] = rsi(close)
-    macd_line, macd_sig, _ = macd(close)
-    df["macd"] = macd_line
-    df["macd_sig"] = macd_sig
+    macd_line, macd_sig, hist = macd(close)
 
     last = df.iloc[-1]
 
-    ema20 = float(last["ema20"])
-    ema50 = float(last["ema50"])
-    ema200 = float(last["ema200"])
-    rsi_val = float(last["rsi"])
-
-    macd_bull = last["macd"] > last["macd_sig"]
-    macd_bear = last["macd"] < last["macd_sig"]
-
-    # Trend
-    if ema20 > ema50 > ema200:
+    # TREND
+    if last["ema9"] > last["ema20"] > last["ema50"]:
         trend = "strong_up"
-    elif ema20 < ema50 < ema200:
+    elif last["ema9"] < last["ema20"] < last["ema50"]:
         trend = "strong_down"
-    elif ema20 > ema50:
-        trend = "up"
-    elif ema20 < ema50:
-        trend = "down"
     else:
-        trend = "flat"
+        trend = "sideways"
 
-    price = float(last["close"])
+    rsi_val = float(last["rsi"])
+    macd_bull = macd_line.iloc[-1] > macd_sig.iloc[-1]
+    macd_bear = macd_line.iloc[-1] < macd_sig.iloc[-1]
 
-    # ---------------------------------
-    # ALL-IN-ONE BUY/SELL DECIDER
-    # ---------------------------------
+    # -------------------------------
+    # Auto-Balancing RSI Mode
+    # -------------------------------
+    if 45 <= rsi_val <= 55:
+        rsi_mode = "neutral"
+    elif rsi_val < 45:
+        rsi_mode = "oversold"
+    else:
+        rsi_mode = "overbought"
 
     side = "WAIT"
     confidence = 60
     reasons = []
 
-    # 1) Strong Reversal Mode
-    if trend in ["strong_down", "down"] and rsi_val < 30 and macd_bull:
-        side = "BUY"
-        confidence = 90
-        reasons.append("Strong oversold reversal (RSI<30 + MACD bull).")
-
-    elif trend in ["strong_up", "up"] and rsi_val > 70 and macd_bear:
-        side = "SELL"
-        confidence = 90
-        reasons.append("Strong overbought reversal (RSI>70 + MACD bear).")
-
-    # 2) Trend-Follow Mode
-    elif trend in ["strong_up", "up"] and rsi_val > 50 and macd_bull:
+    # BUY ZONE
+    if (rsi_mode == "neutral" and macd_bull) or \
+       (rsi_mode == "oversold" and macd_bull) or \
+       (trend == "strong_up" and macd_bull and rsi_val > 48):
         side = "BUY"
         confidence = 82
-        reasons.append("Uptrend trend-follow (RSI>50 + MACD bull).")
+        reasons.append("BUY: Balanced RSI + MACD + Trend")
 
-    elif trend in ["strong_down", "down"] and rsi_val < 50 and macd_bear:
+    # SELL ZONE
+    elif (rsi_mode == "neutral" and macd_bear) or \
+         (rsi_mode == "overbought" and macd_bear) or \
+         (trend == "strong_down" and macd_bear and rsi_val < 52):
         side = "SELL"
         confidence = 82
-        reasons.append("Downtrend trend-follow (RSI<50 + MACD bear).")
+        reasons.append("SELL: Balanced RSI + MACD + Trend")
 
-    # 3) Sideway / Flat Mode
-    elif trend == "flat":
-        if rsi_val > 55 and macd_bull:
-            side = "BUY"
-            confidence = 75
-            reasons.append("Flat but bullish bias.")
-        elif rsi_val < 45 and macd_bear:
-            side = "SELL"
-            confidence = 75
-            reasons.append("Flat but bearish bias.")
-        else:
-            side = "WAIT"
-            confidence = 55
-            reasons.append("Flat neutral → WAIT.")
+    else:
+        side = "WAIT"
+        confidence = 55
+        reasons.append("WAIT: Weak trend / mixed indicators")
 
-    # Safety mid-zone
-    if 45 < rsi_val < 55 and side != "WAIT":
-        confidence -= 7
-        reasons.append("RSI mid-zone, reducing confidence.")
-
-    if side == "WAIT" and not reasons:
-        reasons.append("Mixed signals → WAIT.")
+    price = float(last["close"])
 
     return {
         "side": side,
-        "confidence": int(confidence),
+        "confidence": confidence,
         "trend": trend,
         "price": price,
         "rsi": rsi_val,
@@ -257,12 +239,11 @@ def generate_ai_signal(df):
     }
 
 
-# ======================================================
+# -------------------------
 # ENDPOINT
-# ======================================================
+# -------------------------
 @app.post("/signal", response_model=SignalResponse)
 def signal(req: SignalRequest):
-
     df = fetch_candles(req.pair, req.timeframe, 200)
     sig = generate_ai_signal(df)
 
